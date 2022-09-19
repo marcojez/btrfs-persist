@@ -1,0 +1,322 @@
+#!/usr/bin/python3
+
+import configparser
+import argparse
+import datetime
+import pathlib
+import subprocess
+import re
+import os.path
+import os
+import sys
+
+TIMESTAMP_PATTERN = "{dt.year:04}-{dt.month:02}-{dt.day:02}-{dt.hour:02}{dt.minute:02}"
+SNAPSHOT_PATTERN = "{jobname}_snapshot_{tag}_{timestamp}"
+
+def eprint(*args, **kwargs):
+	print(*args, file=sys.stderr, **kwargs)
+
+def get_current_timestamp():
+	return TIMESTAMP_PATTERN.format(dt=datetime.datetime.now())
+
+def check_jobs(jobs, args, cfg):
+	if args.verbosity > 1:
+		print("Checking whether specified jobs are defined in configuration file")
+	jobs_ok = True
+	for j in jobs:
+		if not j in cfg.sections():
+			eprint(f"Job '{j}' not defined in configuration file")
+			jobs_ok = False
+	if not jobs_ok:
+		exit(1)
+
+def exec(cmdline, exit_on_error=1):
+	try:
+		result = subprocess.check_output(cmdline, shell=True, stderr=subprocess.STDOUT)
+	except subprocess.CalledProcessError as e:
+		eprint(f"An error occurred while running:\n\t{cmdline}\nCommand returned value {e.returncode}")
+		if exit_on_error is not None:
+			exit(exit_on_error)
+		return None
+	return result
+
+def collect_snapshots(sdir, jobname, tag=".*"):
+	snapshots = []
+	with os.scandir(sdir) as it:
+		for entry in it:
+			if re.match(SNAPSHOT_PATTERN.format(jobname=jobname, tag=tag, timestamp=".*"), entry.name) is not None:
+				ctimestr = exec(f"btrfs subvolume show {entry.path} | grep -i \"creation time\" | sed 's/.*time:\\s*//'", exit_on_error=None)
+				if ctimestr is not None:
+					ctime = datetime.datetime.strptime(ctimestr.strip().decode("utf-8"), "%Y-%m-%d %H:%M:%S %z")
+					snapshots.append((entry.path, ctime))
+	return sorted(snapshots, key=lambda x: x[1])
+
+def create_dir_if_configured(path, jobname, option, args, cfg):
+	if not os.path.exists(path):
+		if cfg.getboolean(jobname, option):
+			if args.verbosity > 1:
+				print(f"Creating directory {path}")
+			if not args.dry_run:
+				try:
+					os.makedirs(path)
+				except Exception as e:
+					eprint(f"Error creating directory {path}: {str(e)}")
+					exit(1)
+		else:
+			eprint(f"Directory {path} does not exist")
+
+
+def take_snapshot(jobname, args, cfg):
+	if args.verbosity > 1:
+		print(f"Preparing to take a snapshot for job '{jobname}'")
+
+	fs = cfg.get(jobname, "filesystem")
+	subdir = cfg.get(jobname, "snapshot_dir")
+	sdir = os.path.join(fs, subdir)
+
+	create_dir_if_configured(sdir, jobname, "create_snapshot_dir", args, cfg)
+
+	snapshot_name = SNAPSHOT_PATTERN.format(jobname=jobname, tag=args.tag, timestamp=get_current_timestamp())
+
+	snapshot_path = os.path.join(sdir, snapshot_name)
+	if os.path.exists(snapshot_path):
+		if args.verbosity > 0:
+			print(f"Snapshot {snapshot_path} already exist, skipping")
+		return
+
+	if args.verbosity > 0:
+		if args.verbosity > 1:
+			print(f"Taking snapshot of {fs} into {snapshot_path}")
+		else:
+			print(f"Taking snapshot of {fs}")
+
+	vopt = "-q" if args.verbosity < 1 else ("-v" if args.verbosity > 1 else "")
+
+	if not args.dry_run:
+		exec(f"btrfs {vopt} subvolume snapshot -r {fs} {snapshot_path}")
+
+	if args.verbosity > 1:
+		print(f"Snapshot for job {jobname} taken succesfully")
+
+	nold = cfg.getint(jobname, f"{args.tag}_snapshots", fallback=3)
+
+	if args.verbosity > 1:
+		print(f"Searching for old snapshots to remove (keeping at most {nold} snapshots tagged '{args.tag}')")
+
+	snapshots = collect_snapshots(sdir, jobname, args.tag)
+	if args.dry_run:
+		snapshots.append((snapshot_path, datetime.datetime.now()))
+
+	nrem = max(0, len(snapshots) - nold)
+
+	if args.verbosity > 1:
+		print(f"{len(snapshots)} snapshots found, {nrem} will be removed")
+
+	if nrem > 0:
+		for i in range(nrem):
+			toremove = snapshots[i]
+			if args.verbosity > 1:
+				print(f"Removing snapshot {toremove[0]}")
+			if not args.dry_run:
+				exec(f"btrfs {vopt} subvolume delete {toremove[0]}")
+		if args.verbosity > 1:
+			print("Old snapshots removed succesfully")
+
+def perform_backup_mounted(bdir, jobname, args, cfg):
+	fs = cfg.get(jobname, "filesystem")
+	subdir = cfg.get(jobname, "snapshot_dir")
+	sdir = os.path.join(fs, subdir)
+	
+	if args.verbosity > 1:
+		print(f"Scanning for snapshots in source directory ('{sdir}')")
+
+	ssnapshots = collect_snapshots(sdir, jobname, cfg.get(jobname, "backup_tag_pattern"))
+	num_ssnapshots = len(ssnapshots)
+
+	if args.verbosity > 1:
+		print(f"  {num_ssnapshots} snapshots found")
+		if num_ssnapshots > 0:
+			print(f"  latest snapshot taken on {ssnapshots[-1][1]}")
+
+	if num_ssnapshots == 0:
+		if args.verbosity > 0:
+			print("No snapshots to backup")
+		return
+
+	if args.verbosity > 1:
+		print(f"Scanning for snapshots in target directory ('{bdir}')")
+
+	dsnapshots = collect_snapshots(bdir, jobname)
+	num_dsnapshots = len(dsnapshots)
+
+	if args.verbosity > 1:
+		print(f"  {len(dsnapshots)} snapshots found")
+		if num_dsnapshots > 0:
+			print(f"  latest snapshot taken on {dsnapshots[-1][1]}")
+
+	if num_dsnapshots > 0:
+		missing_snapshots = [s[0] for s in ssnapshots if s[1] > dsnapshots[-1][1]]
+	else:
+		missing_snapshots = [s[0] for s in ssnapshots]
+
+	if len(missing_snapshots) == 0:
+		if args.verbosity > 0:
+			print("Backup directory is already up to date")
+		return
+
+	if cfg.getboolean(jobname, "backup_only_latest"):
+		missing_snapshots = [missing_snapshots[-1]]
+
+	if args.verbosity > 1:
+		print("Searching latest snapshot that exist in both source and target directory")
+
+	base = None
+	ssnames = [os.path.basename(x[0]) for x in ssnapshots]
+	for path, ctime in reversed(dsnapshots):
+		ssname = os.path.basename(path)
+		if ssname in ssnames:
+			base = os.path.join(sdir, ssname)
+			break
+
+	tasks = []
+
+	if base is None:
+		if args.verbosity > 0:
+			print(f"No common base snapshot found, a full backup of {missing_snapshots[0]} is necessary")
+		tasks.append((None, missing_snapshots[0]))
+		del missing_snapshots[0]
+	else:
+		if args.verbosity > 1:
+			print(f"  found: {base}")
+	
+	for ms in missing_snapshots:
+		tasks.append((base, ms))
+		base = ms
+
+	if args.verbosity > 1:
+		print("The following backup tasks will be performed:")
+		for task in tasks:
+			if task[0] is None:
+				print(f"{task[1]} (FULL)")
+			else:
+				print(f"{task[0]} -> {task[1]}")
+
+	vopt = "-q" if args.verbosity < 1 else ("-v" if args.verbosity > 1 else "")
+
+	i = 1
+	for task in tasks:
+		if args.verbosity > 0:
+			btype = "full" if task[0] is None else f"incremental"
+			print(f"{i}/{len(tasks)}: backing up {task[1]} ({btype})")
+		if not args.dry_run:
+			if task[0] is None:
+				exec(f"btrfs {vopt} send {task[1]} | btrfs {vopt} receive {bdir}")
+			else:
+				exec(f"btrfs {vopt} send -p {task[0]} {task[1]} | btrfs {vopt} receive {bdir}")
+		i = i + 1
+
+
+def perform_backup(jobname, args, cfg):
+	if args.verbosity > 1:
+		print(f"Preparing to perform backup for job '{jobname}'")
+
+	bdir = cfg.get(jobname, "backup_dir")
+
+	create_dir_if_configured(bdir, jobname, "create_backup_dir", args, cfg)
+
+	mounted = False
+
+	if cfg.getboolean(jobname, "mount_backup_fs"):
+		if not os.path.ismount(bdir):
+			ropt = "-o ro" if args.dry_run else ""
+			if args.verbosity > 0:
+				print(f"Mounting backup filesystem {bdir}")
+			exec(f"mount {ropt} {bdir}")
+			mounted = True
+		else:
+			if args.verbosity > 1:
+				print("Backup filesystem is already mounted")
+	try:
+		perform_backup_mounted(bdir, jobname, args, cfg)
+	except Exception as e:
+		raise e
+	finally:
+		if mounted:
+			if args.verbosity > 0:
+				print(f"Unmounting backup filesystem {bdir}")
+			exec(f"umount {bdir}")
+
+
+
+
+def snapshot_main(args, cfg):
+	jobs = args.job
+	check_jobs(jobs, args, cfg)
+	for j in jobs:
+		take_snapshot(j, args, cfg)
+
+
+def backup_main(args, cfg):
+	jobs = args.job
+	check_jobs(jobs, args, cfg)
+	for j in jobs:
+		perform_backup(j, args, cfg)
+
+def main():
+	homedir = str(pathlib.Path.home())
+	defcfgfile = os.path.join(homedir, ".config", "btrfs-persist.conf")
+
+	parser = argparse.ArgumentParser(description="Take Btrfs snapshots and perform incremental backup")
+	parser.add_argument("--conf", "-c", default=f"{defcfgfile}", help=f"path to the configuration file to be loaded; default is: {defcfgfile}")
+	parser.add_argument("--dry-run", "-n", action="store_const", const=True, default=False, help="do not actually perform any actions, except mounting and unmounting filesystems when required")
+	parser.add_argument("--quiet", "-q", action="store_const", const=0, default=1, dest="verbosity", help="don't print anything to stdout; warning/error messages will still be emitted to stderr")
+	parser.add_argument("--verbose", "-v", action="store_const", const=2, dest="verbosity", help="produce more information in output messages")
+
+	subparsers = parser.add_subparsers(help="command that specifies which action needs to be done (see below)")
+
+	prs_snapshot = subparsers.add_parser("snapshot", help="take a snapshot", description="Take a snapshot of a Btrfs subvolume")
+	prs_snapshot.add_argument("tag", help="tag assigned to the new snapshot (i.e. 'monthly')")
+	prs_snapshot.add_argument("job", nargs="*", help="one or more job names, as specified in the configuration file")
+	prs_snapshot.set_defaults(func=snapshot_main)
+
+	prs_backup = subparsers.add_parser("backup", help="perform incremental backup", description="Perform an incremental backup to a different filesystem")
+	prs_backup.add_argument("job", nargs="*", help="one or more job names, as specified in the configuration file")
+	prs_backup.set_defaults(func=backup_main)
+
+	args = parser.parse_args(sys.argv[1:])
+
+	if not os.path.exists(args.conf):
+		eprint(f"Configuration file {args.conf} does not exist")
+		exit(1)
+
+	cfg = configparser.ConfigParser()
+
+	cfg["DEFAULT"] = {
+		"snapshot_dir": ".btrfs",
+		"create_snapshot_dir": "yes",
+		"monthly_snapshots": 3,
+		"weekly_snapshots": 5,
+		"daily_snapshots": 7,
+		"hourly_snapshots": 24,
+		"create_backup_dir": "no",
+		"mount_backup_fs": "no",
+		"backup_only_latest": "no",
+		"backup_tag_pattern": ".*"
+	}
+
+	try:
+		with open(args.conf, "r") as f:
+			cfg.read_file(f)
+	except Exception as e:
+		eprint(f"Configuration file error. {str(e)}")
+		exit(1)
+
+	args.func(args, cfg)
+
+	
+if __name__ == "__main__":
+	try:
+		main()
+	except Exception as e:
+		eprint(f"Error: {str(e)}")
+		exit(1)
